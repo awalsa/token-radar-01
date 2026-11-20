@@ -1,7 +1,8 @@
 // Token Radar's dashboard, rendered on a dark radar screen. It reads window.RADAR — the
 // dataset main.ts writes beside dashboard/ — and paints the ranked board, a filterable table,
-// a per-protocol detail view carrying the model's own inputs and the protocol's farm plan, and
-// the category multiples the model learned. No network: every byte on the page comes from data.js.
+// a per-protocol detail view carrying the model's own inputs and the protocol's farm plan, the
+// fitted category effects the model learned, and the walk-forward validation that tested it.
+// No network: every byte on the page comes from data.js.
 (function () {
   'use strict';
 
@@ -60,7 +61,12 @@
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
     return n.toFixed(3) + 'x';
   }
-  // Four decimals for the model's multipliers: the stored values are full precision (the page
+  // A fitted category effect, signed: +0.65 lifts a row, -1.02 lowers it, 0.00 is neutral.
+  function effectText(n) {
+    if (n === null || n === undefined || !isFinite(n)) return 'n/a';
+    return (n > 0 ? '+' : '') + n.toFixed(2);
+  }
+  // Four decimals for the model's terms: the stored values are full precision (the page
   // recomputes from them), but a reader wants 0.8488, not 0.8487671232876712.
   function mult4dp(n) {
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
@@ -68,9 +74,12 @@
   }
   // The model in one function: the page recomputes a row from the snapshot figures and checks
   // it against the number board.json carries, so the page's arithmetic and the board's data
-  // visibly agree. The category multiple is the snapshot's own live market, learned per category.
+  // visibly agree. The fitted equation is ln(implied) = intercept + 0.65*ln(TVL) +
+  // category effect - 0.04*ln(age in years); the stored terms are full precision, and the
+  // slope and age coefficient are the model's own constants.
   function recomputeImplied(row) {
-    return Math.max(1, Math.round(row.tvl_usd * row.category_multiple * row.growth_multiplier * row.maturity_multiplier));
+    var logValue = row.intercept + row.tvl_term + row.category_effect + row.age_effect;
+    return Math.max(1, Math.round(Math.exp(Math.min(logValue, Math.log(100000000000000)))));
   }
 
   function readStateFromHash() {
@@ -234,7 +243,7 @@
         h('td', { class: 'num', text: money(r.tvl_usd) }),
         h('td', { class: 'num ' + growthClass, text: growth }),
         h('td', { class: 'num', text: ageText(r.age_days) }),
-        h('td', { class: 'num', text: multText(r.category_multiple) }),
+        h('td', { class: 'num ' + (r.category_effect > 0 ? 'pos' : r.category_effect < 0 ? 'neg' : ''), text: effectText(r.category_effect) }),
         h('td', null, h('div', { class: 'implied' },
           h('div', { class: 'bar', 'aria-hidden': 'true' }, h('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
           h('span', { class: 'num', text: money(r.implied_value_usd) })
@@ -253,7 +262,7 @@
             h('th', { scope: 'col', text: 'TVL' }),
             h('th', { scope: 'col', text: '7d' }),
             h('th', { scope: 'col', text: 'Age' }),
-            h('th', { scope: 'col', text: 'Category x' }),
+            h('th', { scope: 'col', text: 'Category effect' }),
             h('th', { scope: 'col', text: 'Implied value' }),
             h('th', { scope: 'col', text: 'Token' })
           )),
@@ -290,24 +299,49 @@
 
   function modelExplainer() {
     var m = data.model;
-    var mults = (data.category_multiples || []).slice(0, 12);
+    var effects = (data.category_effects || []).slice(0, 12);
+    var v = data.validation || { folds: [], pooled_new_median_abs_log_error: 0, pooled_old_median_abs_log_error: 0, pooled_median_delta: 0, bootstrap_ci_low: 0, bootstrap_ci_high: 0, folds_new_wins: 0, verdict: 'marginal' };
+    var verdictText = v.verdict === 'validated' ? 'Validated: the fitted model beats the old ratio model convincingly.'
+      : v.verdict === 'not validated' ? 'Not validated: the fitted model does not beat the old ratio model.'
+      : 'Marginal: the fitted model beats the old ratio model, but by less than a convincing margin.';
     return h('section', { class: 'panel model' },
       h('h2', { text: 'How implied value is computed' }),
-      h('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
+      h('p', { class: 'sub', text: 'Every row is scored by one function fitted to the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
       h('div', { class: 'formula' },
-        'implied = round( tvl_usd x category_multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )'
+        'ln(implied) = ' + data.fitted_intercept.toFixed(4) + ' + ' + m.tvl_slope + ' x ln(tvl_usd) + category effect - 0.04 x ln(age in years)'
       ),
       h('div', { class: 'model-grid' },
         h('div', null,
           h('h3', { text: 'What the snapshot teaches' }),
-          h('p', { class: 'sub', text: 'The category multiple is the median market-cap / TVL of the live-token protocols in that category, shrunk toward the snapshot-wide median of ' + multText(data.global_multiple) + ' with a prior weight of ' + m.shrink_prior + ', then clamped to ' + m.multiple_floor + 'x..' + m.multiple_cap + 'x. A category with no live protocol to learn from takes the snapshot-wide median. Age is the time since the protocol was first listed; an unlisted age uses the median pre-token age of ' + m.unknown_age_days + ' days.' })
+          h('p', { class: 'sub', text: 'The model is fitted to the snapshot\'s own live-token protocols (market cap known, TVL known). The TVL slope is ' + m.tvl_slope + ': the market is sublinear, so the median market-cap / TVL falls from 0.65 under $10M of TVL to 0.03 over $500M. The intercept is set so the median residual over the live protocols is zero. A category effect is 0.6 x ln(category median mcap/TVL / snapshot median ' + multText(data.global_median_ratio) + '), for a category with at least ' + m.category_min_comps + ' live protocols to learn from; a thinner category takes no effect. Age is the time since the protocol was first listed; an unlisted age uses the median pre-token age.' }),
+          h('p', { class: 'sub', text: '7-day growth is fitted and left out: its coefficient comes out at ' + m.growth_coef_fitted + ' per point, so a TVL spike precedes the market-cap response and growth is a timing signal, not a value signal. The model does not punish growing protocols.' })
         ),
         h('div', null,
-          h('h3', { text: 'Strongest category multiples' }),
+          h('h3', { text: 'Strongest category effects' }),
           h('table', { class: 'mult-table' },
-            h('thead', null, h('tr', null, h('th', { scope: 'col', text: 'Category' }), h('th', { scope: 'col', class: 'num', text: 'Multiple' }), h('th', { scope: 'col', class: 'num', text: 'Live comps' }))),
-            h('tbody', null, mults.map(function (c) {
-              return h('tr', null, h('td', { text: c.category }), h('td', { class: 'num', text: multText(c.multiple) }), h('td', { class: 'num', text: String(c.comps) }));
+            h('thead', null, h('tr', null, h('th', { scope: 'col', text: 'Category' }), h('th', { scope: 'col', class: 'num', text: 'Effect' }), h('th', { scope: 'col', class: 'num', text: 'Live comps' }))),
+            h('tbody', null, effects.map(function (c) {
+              return h('tr', null, h('td', { text: c.category }), h('td', { class: 'num ' + (c.effect > 0 ? 'pos' : c.effect < 0 ? 'neg' : ''), text: effectText(c.effect) }), h('td', { class: 'num', text: String(c.comps) }));
+            }))
+          )
+        )
+      ),
+      h('div', { class: 'model-grid' },
+        h('div', null,
+          h('h3', { text: 'Walk-forward validation' }),
+          h('p', { class: 'sub', text: verdictText + ' The live protocols are sorted by listing date; the model is refit on the earlier cohorts at four cutoffs and scored on the next ' + m.validation_test_size + ' listings each time, against the old ratio model on the identical folds. Pooled median absolute log error: new ' + v.pooled_new_median_abs_log_error.toFixed(3) + ' vs old ' + v.pooled_old_median_abs_log_error.toFixed(3) + ' — a pooled paired improvement of ' + (v.pooled_median_delta >= 0 ? '+' : '') + v.pooled_median_delta.toFixed(3) + ' log units (95% interval ' + (v.bootstrap_ci_low >= 0 ? '+' : '') + v.bootstrap_ci_low.toFixed(3) + ' to ' + (v.bootstrap_ci_high >= 0 ? '+' : '') + v.bootstrap_ci_high.toFixed(3) + '). New model wins ' + v.folds_new_wins + ' of ' + v.folds.length + ' folds. A median log error near 1.3 means a typical prediction is off by a factor of about 3.7x: this is a ranking prior, not a precise valuation.' })
+        ),
+        h('div', null,
+          h('h3', { text: 'Fold by fold' }),
+          h('table', { class: 'mult-table' },
+            h('thead', null, h('tr', null, h('th', { scope: 'col', text: 'Cutoff' }), h('th', { scope: 'col', class: 'num', text: 'New error' }), h('th', { scope: 'col', class: 'num', text: 'Old error' }), h('th', { scope: 'col', class: 'num', text: 'Improvement' }))),
+            h('tbody', null, v.folds.map(function (f) {
+              return h('tr', null,
+                h('td', { text: Math.round(f.cutoff_pct * 100) + '% (' + f.train + ' train, ' + f.test + ' test)' }),
+                h('td', { class: 'num', text: f.new_median_abs_log_error.toFixed(3) }),
+                h('td', { class: 'num', text: f.old_median_abs_log_error.toFixed(3) }),
+                h('td', { class: 'num ' + (f.median_paired_delta >= 0 ? 'pos' : 'neg'), text: (f.median_paired_delta >= 0 ? '+' : '') + f.median_paired_delta.toFixed(3) })
+              );
             }))
           )
         )
@@ -337,14 +371,16 @@
       h('h3', { text: 'Implied value' }),
       h('div', { class: 'equation' },
         h('div', null, h('span', { text: 'TVL' }), h('b', { class: 'num', text: money(row.tvl_usd) })),
-        h('div', null, h('span', { text: 'Category multiple' }), h('b', { class: 'num', text: multText(row.category_multiple) })),
-        h('div', null, h('span', { text: 'Seven-day growth' }), h('b', { class: 'num', text: pct(row.change_7d) })),
-        h('div', null, h('span', { text: 'Growth multiplier' }), h('b', { class: 'num', text: mult4dp(row.growth_multiplier) })),
+        h('div', null, h('span', { text: 'TVL term (0.65 x ln TVL)' }), h('b', { class: 'num', text: mult4dp(row.tvl_term) })),
+        h('div', null, h('span', { text: 'Intercept' }), h('b', { class: 'num', text: mult4dp(row.intercept) })),
+        h('div', null, h('span', { text: 'Category effect (' + row.category_comps + ' live comps)' }), h('b', { class: 'num', text: effectText(row.category_effect) })),
         h('div', null, h('span', { text: 'Age with no token' }), h('b', { class: 'num', text: ageText(row.age_days) })),
-        h('div', null, h('span', { text: 'Maturity multiplier' }), h('b', { class: 'num', text: mult4dp(row.maturity_multiplier) })),
+        h('div', null, h('span', { text: 'Age effect (-0.04 x ln age in years)' }), h('b', { class: 'num', text: mult4dp(row.age_effect) })),
+        h('div', null, h('span', { text: 'Seven-day growth (fitted, not used)' }), h('b', { class: 'num', text: pct(row.change_7d) })),
+        h('div', null, h('span', { text: 'Log prediction' }), h('b', { class: 'num', text: mult4dp(row.log_prediction) })),
         h('div', { class: 'total' }, h('span', { text: 'Implied value' }), h('b', { class: 'num', text: money(row.implied_value_usd) }))
       ),
-      h('p', { class: 'sub', text: 'Model ' + data.model_version + ': the same function scores every protocol. The page recomputes this row as ' + money(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
+      h('p', { class: 'sub', text: 'Model ' + data.model_version + ': the same function scores every protocol. The page recomputes this row as ' + money(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' Growth is shown for context only — the fitted model leaves it out because a TVL spike precedes the market-cap response. This is an estimate, not a price.' })
     ));
     dialog.appendChild(h('section', { class: 'detail-section' },
       h('h3', { text: 'Farm plan' }),

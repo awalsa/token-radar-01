@@ -9,7 +9,7 @@
   var data = window.RADAR;
   if (!data) return;
   var app = document.getElementById('board');
-  var view = { q: '', category: 'all', watchlist: false, tab: 'pre-token', sort: 'implied', dir: -1, selected: null };
+  var view = { q: '', category: 'all', watchlist: false, tierUncertain: false, tab: 'pre-token', sort: 'implied', dir: -1, selected: null };
 
   // Build one element: attrs maps names to values ('class' sets the class, 'text' sets the
   // text, 'html' sets the markup, 'on*' registers a listener, anything else becomes an
@@ -90,6 +90,7 @@
     if (params.get('p')) view.selected = params.get('p');
     if (params.get('category')) view.category = params.get('category');
     if (params.get('watchlist') === '1') view.watchlist = true;
+    if (params.get('tier') === '1') view.tierUncertain = true;
     if (params.get('sort')) view.sort = params.get('sort');
     if (params.get('tab')) view.tab = params.get('tab');
   }
@@ -98,6 +99,7 @@
     if (view.q) params.set('q', view.q);
     if (view.category !== 'all') params.set('category', view.category);
     if (view.watchlist) params.set('watchlist', '1');
+    if (view.tierUncertain) params.set('tier', '1');
     if (view.sort !== 'implied') params.set('sort', view.sort);
     if (view.tab !== 'pre-token') params.set('tab', view.tab);
     if (view.selected) params.set('p', view.selected);
@@ -110,6 +112,7 @@
     var q = view.q.trim().toLowerCase();
     return data.rows.filter(function (r) {
       if (view.watchlist && !r.watchlist) return false;
+      if (view.tierUncertain && !r.tier_uncertain) return false;
       if (view.category !== 'all' && r.category !== view.category) return false;
       if (!q) return true;
       var hay = [r.name, r.slug, r.category, (r.chains || []).join(' ')].join(' ').toLowerCase();
@@ -193,6 +196,8 @@
     select.addEventListener('change', function () { view.category = select.value; writeStateToHash(); paint(); });
     var watch = h('input', { type: 'checkbox', id: 'watchlist', checked: view.watchlist ? 'checked' : null, 'aria-label': 'Watchlist only' });
     watch.addEventListener('change', function () { view.watchlist = watch.checked; writeStateToHash(); paint(); });
+    var tier = h('input', { type: 'checkbox', id: 'tier', checked: view.tierUncertain ? 'checked' : null, 'aria-label': 'Tier-uncertain only' });
+    tier.addEventListener('change', function () { view.tierUncertain = tier.checked; writeStateToHash(); paint(); });
     var sort = h('select', { id: 'sort', 'aria-label': 'Sort the board' },
       h('option', { value: 'implied', text: 'Implied value', selected: view.sort === 'implied' ? 'selected' : null }),
       h('option', { value: 'tvl', text: 'TVL', selected: view.sort === 'tvl' ? 'selected' : null }),
@@ -208,6 +213,7 @@
       h('div', { class: 'field' }, h('label', { for: 'q', text: 'Search' }), search),
       h('div', { class: 'field' }, h('label', { for: 'category', text: 'Category' }), select),
       h('label', { class: 'check', for: 'watchlist' }, watch, 'Watchlist only'),
+      h('label', { class: 'check', for: 'tier' }, tier, 'Tier-uncertain only'),
       h('div', { class: 'field' }, h('label', { for: 'sort', text: 'Sort by' }), sort),
       dir,
       h('div', { class: 'field' }, h('span', { class: 'sub', text: 'Token status' }), h('div', { class: 'tabs' }, pre, live)),
@@ -221,7 +227,7 @@
       return h('div', { class: 'panel' }, h('div', { class: 'empty' },
         h('h2', { text: 'No protocol matches that filter' }),
         h('p', { text: 'Clear the search or pick another category to see the board again.' }),
-        h('button', { class: 'button primary', type: 'button', text: 'Clear filters', onclick: function () { view.q = ''; view.category = 'all'; view.watchlist = false; writeStateToHash(); paint(); } })
+        h('button', { class: 'button primary', type: 'button', text: 'Clear filters', onclick: function () { view.q = ''; view.category = 'all'; view.watchlist = false; view.tierUncertain = false; writeStateToHash(); paint(); } })
       ));
     }
     var max = list[0].implied_value_usd || 1;
@@ -244,10 +250,14 @@
         h('td', { class: 'num ' + growthClass, text: growth }),
         h('td', { class: 'num', text: ageText(r.age_days) }),
         h('td', { class: 'num ' + (r.category_effect > 0 ? 'pos' : r.category_effect < 0 ? 'neg' : ''), text: effectText(r.category_effect) }),
-        h('td', null, h('div', { class: 'implied' },
-          h('div', { class: 'bar', 'aria-hidden': 'true' }, h('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
-          h('span', { class: 'num', text: money(r.implied_value_usd) })
-        )),
+        h('td', null,
+          h('div', { class: 'implied' },
+            h('div', { class: 'bar', 'aria-hidden': 'true' }, h('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
+            h('span', { class: 'num', text: money(r.implied_value_usd) })
+          ),
+          h('div', { class: 'sub band', text: 'band ' + money(r.band_low_usd) + ' – ' + money(r.band_high_usd) }),
+          r.tier_uncertain ? h('span', { class: 'badge warn', text: 'Tier-uncertain' }) : null
+        ),
         h('td', null, h('span', { class: 'status', text: 'no token' }))
       );
       tbody.appendChild(tr);
@@ -300,7 +310,9 @@
   function modelExplainer() {
     var m = data.model;
     var effects = (data.category_effects || []).slice(0, 12);
-    var v = data.validation || { folds: [], pooled_new_median_abs_log_error: 0, pooled_old_median_abs_log_error: 0, pooled_median_delta: 0, bootstrap_ci_low: 0, bootstrap_ci_high: 0, folds_new_wins: 0, verdict: 'marginal' };
+    var v = data.validation || { folds: [], pooled_new_median_abs_log_error: 0, pooled_old_median_abs_log_error: 0, pooled_median_delta: 0, bootstrap_ci_low: 0, bootstrap_ci_high: 0, folds_new_wins: 0, verdict: 'marginal', category_errors: [] };
+    var mcByCat = {};
+    (v.category_errors || []).forEach(function (e) { mcByCat[e.category] = e; });
     var verdictText = v.verdict === 'validated' ? 'Validated: the fitted model beats the old ratio model convincingly.'
       : v.verdict === 'not validated' ? 'Not validated: the fitted model does not beat the old ratio model.'
       : 'Marginal: the fitted model beats the old ratio model, but by less than a convincing margin.';
@@ -319,9 +331,10 @@
         h('div', null,
           h('h3', { text: 'Strongest category effects' }),
           h('table', { class: 'mult-table' },
-            h('thead', null, h('tr', null, h('th', { scope: 'col', text: 'Category' }), h('th', { scope: 'col', class: 'num', text: 'Effect' }), h('th', { scope: 'col', class: 'num', text: 'Live comps' }))),
+            h('thead', null, h('tr', null, h('th', { scope: 'col', text: 'Category' }), h('th', { scope: 'col', class: 'num', text: 'Effect' }), h('th', { scope: 'col', class: 'num', text: 'Live comps' }), h('th', { scope: 'col', class: 'num', text: 'Fold error m' }))),
             h('tbody', null, effects.map(function (c) {
-              return h('tr', null, h('td', { text: c.category }), h('td', { class: 'num ' + (c.effect > 0 ? 'pos' : c.effect < 0 ? 'neg' : ''), text: effectText(c.effect) }), h('td', { class: 'num', text: String(c.comps) }));
+              var mc = mcByCat[c.category];
+              return h('tr', null, h('td', { text: c.category }), h('td', { class: 'num ' + (c.effect > 0 ? 'pos' : c.effect < 0 ? 'neg' : ''), text: effectText(c.effect) }), h('td', { class: 'num', text: String(c.comps) }), h('td', { class: 'num', text: mc ? mc.median_abs_log_error.toFixed(3) : 'pooled' }));
             }))
           )
         )
@@ -329,7 +342,8 @@
       h('div', { class: 'model-grid' },
         h('div', null,
           h('h3', { text: 'Walk-forward validation' }),
-          h('p', { class: 'sub', text: verdictText + ' The live protocols are sorted by listing date; the model is refit on the earlier cohorts at four cutoffs and scored on the next ' + m.validation_test_size + ' listings each time, against the old ratio model on the identical folds. Pooled median absolute log error: new ' + v.pooled_new_median_abs_log_error.toFixed(3) + ' vs old ' + v.pooled_old_median_abs_log_error.toFixed(3) + ' — a pooled paired improvement of ' + (v.pooled_median_delta >= 0 ? '+' : '') + v.pooled_median_delta.toFixed(3) + ' log units (95% interval ' + (v.bootstrap_ci_low >= 0 ? '+' : '') + v.bootstrap_ci_low.toFixed(3) + ' to ' + (v.bootstrap_ci_high >= 0 ? '+' : '') + v.bootstrap_ci_high.toFixed(3) + '). New model wins ' + v.folds_new_wins + ' of ' + v.folds.length + ' folds. A median log error near 1.3 means a typical prediction is off by a factor of about 3.7x: this is a ranking prior, not a precise valuation.' })
+          h('p', { class: 'sub', text: verdictText + ' The live protocols are sorted by listing date; the model is refit on the earlier cohorts at four cutoffs and scored on the next ' + m.validation_test_size + ' listings each time, against the old ratio model on the identical folds. Pooled median absolute log error: new ' + v.pooled_new_median_abs_log_error.toFixed(3) + ' vs old ' + v.pooled_old_median_abs_log_error.toFixed(3) + ' — a pooled paired improvement of ' + (v.pooled_median_delta >= 0 ? '+' : '') + v.pooled_median_delta.toFixed(3) + ' log units (95% interval ' + (v.bootstrap_ci_low >= 0 ? '+' : '') + v.bootstrap_ci_low.toFixed(3) + ' to ' + (v.bootstrap_ci_high >= 0 ? '+' : '') + v.bootstrap_ci_high.toFixed(3) + '). New model wins ' + v.folds_new_wins + ' of ' + v.folds.length + ' folds. A median log error near 1.3 means a typical prediction is off by a factor of about 3.7x: this is a ranking prior, not a precise valuation.' }),
+          h('p', { class: 'sub', text: 'Value band: every row carries implied \u00d7 e^(\u00b1m), where m is its category\u2019s median fold error (the pooled ' + v.pooled_new_median_abs_log_error.toFixed(3) + ' when a category has too few fold protocols for its own number). A row is flagged Tier-uncertain when its band spans more than the whole $2,000\u2013$25,000 capital range, so the band alone cannot say which tier that protocol justifies \u2014 the tier in each farm plan comes from TVL, not from the value estimate. The farm plan itself enters in two tranches: $2,000 first, then a day-14 top-up to the full tier only when the 7-day change is 0% or better and TVL is holding.' })
         ),
         h('div', null,
           h('h3', { text: 'Fold by fold' }),
@@ -381,6 +395,23 @@
         h('div', { class: 'total' }, h('span', { text: 'Implied value' }), h('b', { class: 'num', text: money(row.implied_value_usd) }))
       ),
       h('p', { class: 'sub', text: 'Model ' + data.model_version + ': the same function scores every protocol. The page recomputes this row as ' + money(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' Growth is shown for context only — the fitted model leaves it out because a TVL spike precedes the market-cap response. This is an estimate, not a price.' })
+    ));
+    var bandNote = row.band_mc_pooled
+      ? 'The band uses the pooled fold error (' + row.band_mc.toFixed(3) + ' log units): this category has too few fold protocols for its own error, so the model-wide error stands in.'
+      : 'The band uses this category\u2019s own fold error (' + row.band_mc.toFixed(3) + ' log units over ' + row.band_mc_observations + ' fold protocols).';
+    dialog.appendChild(h('section', { class: 'detail-section' },
+      h('h3', { text: 'Value band and shrinkage receipt' }),
+      h('div', { class: 'equation' },
+        h('div', null, h('span', { text: 'Implied value (point estimate)' }), h('b', { class: 'num', text: money(row.implied_value_usd) })),
+        h('div', null, h('span', { text: 'Band low (implied \u00f7 e^m)' }), h('b', { class: 'num', text: money(row.band_low_usd) })),
+        h('div', null, h('span', { text: 'Band high (implied \u00d7 e^m)' }), h('b', { class: 'num', text: money(row.band_high_usd) })),
+        h('div', null, h('span', { text: 'Category fold error m' }), h('b', { class: 'num', text: row.band_mc.toFixed(3) + (row.band_mc_pooled ? ' (pooled)' : '') })),
+        h('div', null, h('span', { text: 'Category live comps' }), h('b', { class: 'num', text: String(row.category_comps) })),
+        h('div', null, h('span', { text: 'Category median mcap / TVL' }), h('b', { class: 'num', text: multText(row.category_median_ratio) })),
+        h('div', null, h('span', { text: 'EB shrinkage weight n / (n+2)' }), h('b', { class: 'num', text: row.category_eb_weight.toFixed(2) }))
+      ),
+      h('p', { class: 'sub', text: bandNote + ' The receipt shows how much this category\u2019s own data weighs against the global prior: a weight near 1 means the category premium is earned by many live comps, a weight near 0 means it is mostly borrowed. The model itself applies 0.6x to the category effect when a category has at least 4 live comps, and no effect below that.' }),
+      row.tier_uncertain ? h('p', { class: 'sub', text: 'Tier-uncertain: this band spans more than the whole $2,000\u2013$25,000 capital range, so the band alone cannot say which capital tier this protocol justifies \u2014 the tier in the farm plan comes from TVL, not from this value estimate.' }) : null
     ));
     dialog.appendChild(h('section', { class: 'detail-section' },
       h('h3', { text: 'Farm plan' }),

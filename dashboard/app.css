@@ -113,6 +113,8 @@ tbody tr:last-child td { border-bottom: 0; }
   background: rgba(251, 191, 36, 0.14); color: var(--amber); border: 1px solid rgba(251, 191, 36, 0.4);
   font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap;
 }
+.badge.warn { background: rgba(248, 113, 113, 0.14); color: var(--negative); border-color: rgba(248, 113, 113, 0.4); }
+.band { margin-top: 2px; }
 .bar { width: 110px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
 .bar i { display: block; height: 100%; background: var(--accent); }
 .implied { display: flex; align-items: center; gap: var(--step-2); }

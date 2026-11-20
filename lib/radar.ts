@@ -160,6 +160,22 @@ export interface RadarRow {
   log_prediction: number;
   watchlist: boolean;
   farm_steps: string[];
+  /** The value band: implied x e^(+-m_c), where m_c is this row's category fold error
+   * (the pooled error when the category has too few fold protocols to learn from). */
+  band_low_usd: number;
+  band_high_usd: number;
+  band_mc: number;
+  band_mc_observations: number;
+  band_mc_pooled: boolean;
+  /** True when the band spans more than the whole $2,000-$25,000 capital range, so the
+   * band alone cannot say which capital tier this protocol justifies. */
+  tier_uncertain: boolean;
+  /** The shrinkage receipt: the empirical-Bayes weight n/(n+2) for this row's category,
+   * and the category's median market-cap / TVL. A diagnostic of how much the category's
+   * own data weighs against the global prior; the model itself applies 0.6x when a
+   * category has at least 4 live comps, else no effect. */
+  category_eb_weight: number;
+  category_median_ratio: number;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value. */
@@ -191,6 +207,15 @@ export interface ValidationFold {
   median_paired_delta: number;
 }
 
+/** One category's walk-forward error: the median absolute log error over the fold test
+ * protocols in that category. Only categories with enough test protocols to learn from
+ * get their own number; the rest fall back to the pooled error. */
+export interface CategoryError {
+  category: string;
+  median_abs_log_error: number;
+  observations: number;
+}
+
 /** The walk-forward validation summary. */
 export interface ValidationResult {
   folds: ValidationFold[];
@@ -201,6 +226,7 @@ export interface ValidationResult {
   bootstrap_ci_high: number;
   folds_new_wins: number;
   verdict: 'validated' | 'marginal' | 'not validated';
+  category_errors: CategoryError[];
 }
 
 /** Everything the dashboard needs: the board, the live set, and the model it runs. */
@@ -540,6 +566,7 @@ export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL)
   const pooledNew: number[] = [];
   const pooledOld: number[] = [];
   const pooledDelta: number[] = [];
+  const byCategory = new Map<string, number[]>();
   let wins = 0;
   let worstFoldDelta = 0;
   for (const cutoff of model.validation_cutoffs) {
@@ -563,6 +590,10 @@ export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL)
       pooledNew.push(eNew);
       pooledOld.push(eOld);
       pooledDelta.push(eOld - eNew);
+      const catKey = p.category ?? '(none)';
+      const catList = byCategory.get(catKey) ?? [];
+      catList.push(eNew);
+      byCategory.set(catKey, catList);
     }
     newErrors.sort((a, b) => a - b);
     oldErrors.sort((a, b) => a - b);
@@ -609,6 +640,17 @@ export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL)
   } else if (pooledNewMed > 1.45 || pooledDeltaMed <= 0 || ciLow <= 0 || wins <= folds.length - 2) {
     verdict = 'not validated';
   }
+  // One fold error per category, for the dashboard's value bands: the median absolute log
+  // error over that category's fold test protocols. A category with fewer test protocols
+  // than the model's own minimum takes no number of its own — the pooled error is the
+  // fallback, so a thin category never gets a band from one or two wild errors.
+  const categoryErrors: CategoryError[] = [...byCategory.entries()]
+    .filter(([, list]) => list.length >= model.category_min_comps)
+    .map(([category, list]) => {
+      const sorted = list.slice().sort((a, b) => a - b);
+      return { category, median_abs_log_error: medianOf(sorted, 0), observations: list.length };
+    })
+    .sort((a, b) => b.median_abs_log_error - a.median_abs_log_error || (a.category < b.category ? -1 : 1));
   return {
     folds,
     pooled_new_median_abs_log_error: pooledNewMed,
@@ -618,6 +660,7 @@ export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL)
     bootstrap_ci_high: ciHigh,
     folds_new_wins: wins,
     verdict,
+    category_errors: categoryErrors,
   };
 }
 
@@ -667,6 +710,14 @@ function gasUsd(n: number): string {
   if (n >= 1) return `$${n % 1 === 0 ? n : n.toFixed(2)}`;
   if (n >= 0.01) return `$${n.toFixed(2)}`;
   return `$${n.toFixed(3)}`;
+}
+
+/** A large dollar amount, shortened so a farm step can name it in one breath. */
+function compactUsd(n: number): string {
+  if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}B`;
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `$${Math.round(n / 1e3)}K`;
+  return `$${Math.round(n)}`;
 }
 
 /** How much capital one farm position needs, from the protocol's own TVL. */
@@ -801,17 +852,50 @@ function categoryAction(p: SnapshotProtocol, capital: number, chain: string): st
  * from the chain table (ETH near $4,000, mainnet near 8 gwei); the bridge-out step warns
  * that native bridging home costs about $12 of claim gas and can take 7 days, so a small
  * position can cost more to unwind than it earns. The last step totals the plan.
+ *
+ * The entry is two tranches, not one full deposit. A point estimate with a median log
+ * error near 1.3 can be off by a factor of about 3.7 either way, so committing the full
+ * tier to it is the plan's weakest link: tranche 1 deploys only the $2,000 floor tier,
+ * and tranche 2 tops up to the row's full tier on day 14 only when the thesis still
+ * holds — the 7-day TVL change is 0% or better and TVL is at or above its snapshot
+ * value. If either fails, the top-up is skipped and the $2,000 tranche 1 is held alone,
+ * so the bridge-out cost and the 10% buffer apply to a smaller base. A row whose full
+ * tier is already $2,000 has no second tranche. The checkpoint sits inside the hold, so
+ * it costs gas only, no extra calendar time.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = primaryChain(p);
   const gas = gasFor(chain);
   const capital = stakeFor(p);
+  const floorTier = 2000;
+  const topUp = capital - floorTier;
   const hold = qualifyingHoldDays(age);
   const weeks = Math.max(1, Math.round(hold / 7));
-  const action = categoryAction(p, capital, chain);
+  const entryAction = categoryAction(p, floorTier, chain);
   const capitalText = `$${capital.toLocaleString('en-US')}`;
-  const totalGas = gas.simple + gas.deposit + gas.weekly * weeks + gas.bridge + gas.simple;
+  const floorText = `$${floorTier.toLocaleString('en-US')}`;
+  const topUpText = `$${topUp.toLocaleString('en-US')}`;
+  const entryGas = gas.deposit + gas.swap;
+  const topUpGas = topUp > 0 ? gas.deposit + gas.swap : 0;
+  const totalGas = gas.simple + entryGas + topUpGas + gas.weekly * weeks + gas.bridge + gas.simple;
+  const tvlText = compactUsd(p.tvl_usd);
   const step = (text: string, cost: string, time: string): FarmStep => ({ text, cost, time });
+  const checkpoint =
+    topUp > 0
+      ? step(
+          `Day 14 checkpoint: top up ${topUpText} to the full ${capitalText} tier only if the 7-day TVL change is 0% or better and TVL is at or above the snapshot ${tvlText}. If either fails, skip the top-up and hold the ${floorText} tranche 1 alone.`,
+          `about ${gasUsd(topUpGas)} of gas on ${chain} for the second deposit and swap`,
+          '15 minutes on day 14',
+        )
+      : step(
+          `Day 14 checkpoint: confirm TVL is holding at or above the snapshot ${tvlText}. This row's full tier is already ${floorText}, so there is no second tranche to deploy.`,
+          `nothing to deploy, one check of the protocol's TVL`,
+          '5 minutes on day 14',
+        );
+  const totalNote =
+    topUp > 0
+      ? ` Total plan gas is about ${gasUsd(totalGas)} on ${chain} for a ${capitalText} position over ${hold} days (about ${gasUsd(topUpGas)} less if the day-14 top-up is skipped), so budget ${capitalText} plus gas in the wallet.`
+      : ` Total plan gas is about ${gasUsd(totalGas)} on ${chain} for a ${capitalText} position over ${hold} days, so budget ${capitalText} plus gas in the wallet.`;
   return [
     step(
       `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
@@ -819,10 +903,11 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       '5 minutes',
     ),
     step(
-      action,
-      `${capitalText} of capital and about ${gasUsd(gas.deposit)} of gas on ${chain}`,
-      '15 minutes to set up',
+      `Tranche 1 (entry): ${entryAction}`,
+      `${floorText} of capital and about ${gasUsd(entryGas)} of gas on ${chain} (deposit plus swap)`,
+      '20 minutes to set up',
     ),
+    checkpoint,
     step(
       `Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote, and keep the receipts.`,
       `about ${gasUsd(gas.weekly)} of gas a week on ${chain}`,
@@ -839,14 +924,9 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       '7 days to bridge out',
     ),
     step(
-      `Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes.`,
-      `no fee to check, one ${gasUsd(gas.simple)} transaction to claim`,
-      '10 minutes',
-    ),
-    step(
-      `Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it. Total plan gas is about ${gasUsd(totalGas)} on ${chain} for a ${capitalText} position over ${hold} days, so budget ${capitalText} plus gas in the wallet.`,
-      'nothing but the log',
-      '5 minutes',
+      `Before you withdraw, claim only from the protocol's own points or rewards page, then write the wallet, the dates and every transaction in a farm log.${totalNote}`,
+      `one ${gasUsd(gas.simple)} transaction to claim, nothing but the log`,
+      '15 minutes',
     ),
   ];
 }
@@ -868,8 +948,41 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
     }));
 }
 
+/** The capital-tier range the value band is measured against: $2,000 to $25,000 is a
+ * 12.5x span. A band wider than that spans the whole tier range, so the band alone
+ * cannot say which capital tier a protocol justifies. */
+const TIER_SPAN = 12.5;
+
+/** A row's value band and shrinkage receipt, from its category's fold error and the
+ * fitted category effects. The model itself is untouched: this only reads the
+ * validation the model already ran. */
+export function rowBand(
+  row: BoardRow,
+  fitted: FittedModel,
+  validation: ValidationResult,
+): Pick<RadarRow, 'band_low_usd' | 'band_high_usd' | 'band_mc' | 'band_mc_observations' | 'band_mc_pooled' | 'tier_uncertain' | 'category_eb_weight' | 'category_median_ratio'> {
+  const key = row.category ?? '(none)';
+  const mcEntry = validation.category_errors.find((e) => e.category === key);
+  const mc = mcEntry !== undefined ? mcEntry.median_abs_log_error : validation.pooled_new_median_abs_log_error;
+  const bandLow = Math.max(1, Math.round(row.implied_value_usd * Math.exp(-mc)));
+  const bandHigh = Math.max(1, Math.round(row.implied_value_usd * Math.exp(mc)));
+  const effectEntry = fitted.effects.get(key);
+  const comps = effectEntry !== undefined ? effectEntry.comps : row.model.category_comps;
+  const medianRatio = effectEntry !== undefined ? effectEntry.medianRatio : fitted.globalMedianRatio;
+  return {
+    band_low_usd: bandLow,
+    band_high_usd: bandHigh,
+    band_mc: round4dp(mc),
+    band_mc_observations: mcEntry !== undefined ? mcEntry.observations : 0,
+    band_mc_pooled: mcEntry === undefined,
+    tier_uncertain: bandHigh / bandLow > TIER_SPAN,
+    category_eb_weight: round4dp(comps / (comps + 2)),
+    category_median_ratio: round4dp(medianRatio),
+  };
+}
+
 /** A board row's compact form for data.js, with the farm plan it ships. */
-export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
+export function radarRow(row: BoardRow, watchlist: Set<string>, band: ReturnType<typeof rowBand>): RadarRow {
   return {
     rank: row.rank,
     slug: row.slug,
@@ -891,6 +1004,7 @@ export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
     log_prediction: row.model.log_prediction,
     watchlist: watchlist.has(row.slug),
     farm_steps: row.farm_steps,
+    ...band,
   };
 }
 
@@ -920,7 +1034,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     fitted_intercept: round4dp(fitted.intercept),
     category_effects: categoryEffectsList,
     validation,
-    rows: board.map((r) => radarRow(r, watchlistSlugs)),
+    rows: board.map((r) => radarRow(r, watchlistSlugs, rowBand(r, fitted, validation))),
     live,
   };
   return { board, radar };
